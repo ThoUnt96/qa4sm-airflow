@@ -1,5 +1,5 @@
 """
-This is the processing pipeline to update SMOS L2 data in qa4sm.
+This is the processing pipeline to update SMAP L3 data in qa4sm.
 It will download new image data from FTP, update time series in the qa4sm
 datastore as far as image data is available and send the updated time series
 period through the API to the DB.
@@ -20,15 +20,17 @@ from misc import (
 )
 
 load_qa4sm_dotenv()
-IMAGE = os.environ["ERA_DAG_IMAGE"]
+IMAGE = os.environ["SMAP_DAG_IMAGE"]
 QA4SM_IP_OR_URL = os.environ["QA4SM_IP_OR_URL"]
 QA4SM_PORT_OR_NONE = os.environ["QA4SM_PORT_OR_NONE"]
 QA4SM_API_TOKEN = os.environ["QA4SM_API_TOKEN"]
 QA4SM_DATA_PATH = os.environ["QA4SM_DATA_PATH"]  # On the HOST machine
 EMAIL_ON_FAILURE = bool(int(os.environ.get("EMAIL_ON_FAILURE", 0)))
 
-# Source is on the HOST machine (not airflow container), target is in the worker image
-#   see also https://stackoverflow.com/questions/31381322/docker-in-docker-cannot-mount-volume
+# Source is on the HOST machine (not airflow container), target is in the
+# worker image
+#   see also https://stackoverflow.com/questions/31381322/docker-in-docker
+#   -cannot-mount-volume
 data_mount = Mount(target="/qa4sm/data", source=QA4SM_DATA_PATH, type='bind')
 
 logger = logging.getLogger(__name__)
@@ -38,12 +40,12 @@ All versions are added to the list. The dag itself can be
 (de)activated in the GUI afterwards
 """
 DAG_SETUP = {
-    'ERA5_LAND_latest-ext': {
+    'SMAP_L3_V9': {
         # Paths here refer to the worker image and should not be changed!
-        'img_path': "/qa4sm/data/ERA5_LAND/ERA5_LAND_latest-ext/images/",
-        'ts_path': "/qa4sm/data/ERA5_LAND/ERA5_LAND_latest-ext/timeseries/",
-        'ext_start_date': "2025-01-01",
-        'qa4sm_dataset_id': "62",
+        'img_path': "/qa4sm/data/SMAP_L3/SMAP_V9_AM_PM-ext/images",
+        'ts_path': "/qa4sm/data/SMAP_L3/SMAP_V9_AM_PM-ext/timeseries",
+        'ext_start_date': "2025-01-26",
+        'qa4sm_dataset_id': "64",
     },
 }
 
@@ -60,7 +62,7 @@ def get_timerange_from_yml(
     else:
         with open(img_yml, 'r') as stream:
             img_props = yaml.safe_load(stream)
-        img_to = pd.to_datetime(img_props['period_to']).to_pydatetime()
+        img_to = pd.to_datetime(img_props['last_day']).to_pydatetime()
 
     if (ts_yml is None) or (not os.path.isfile(ts_yml)):
         logging.info(f"No ts yml file: {ts_yml}")
@@ -68,7 +70,8 @@ def get_timerange_from_yml(
     else:
         with open(ts_yml, 'r') as stream:
             ts_props = yaml.safe_load(stream)
-        ts_to = pd.to_datetime(ts_props['img2ts_kwargs']['enddate']).to_pydatetime()
+        ts_to = pd.to_datetime(
+            ts_props['last_day']).to_pydatetime()
 
     if ts_to is not None:
         ts_next = ts_to + timedelta(days=1)
@@ -100,8 +103,8 @@ for version, dag_settings in DAG_SETUP.items():
     ts_yml_file = os.path.join(ts_path, 'overview.yml')
     img_yml_file = os.path.join(img_path, 'overview.yml')
 
-    with DAG(
-            f"ERA5Land-{version}-Processing",
+    with (DAG(
+            f"SMAP_L3-{version}-Processing",
             default_args={
                 "depends_on_past": False,
                 "email": ["support@qa4sm.eu"],
@@ -110,28 +113,31 @@ for version, dag_settings in DAG_SETUP.items():
                 "retries": 1,
                 "retry_delay": timedelta(hours=1),
             },
-            description="Update ERA image data",
+            description="Update SMAP image data",
             schedule=timedelta(weeks=1),
-            start_date=datetime(2024, 10, 28),
+            start_date=datetime(2025, 12, 14),
             catchup=False,  # avoid duplicate processing
-            tags=["era", "download", "reshuffle", "update"],
-    ) as dag:
-        #Check data setup -----------------------------------------------------
+            tags=["smap_l3", "download", "reshuffle", "update"],
+    ) as dag):
+        # Check data setup
+        # -----------------------------------------------------
         _task_id = "verify_dir_available"
         _doc = f"""
-        Check if the data store is mounted, check if {img_path} and {ts_path} exist.
+        Check if the data store is mounted, check if {img_path} and 
+{ts_path} exist.
         """
-        _command = bash_command = f"bash -c '[ -d \"{img_path}\" ] && [ -d \"{ts_path}\" ] || exit 1'"
+        _command = f"bash -c '[ -d \"{img_path}\" ] && [ -d \"{ts_path}\" ] || exit 1'"
         logging.info(f"Running Container Command in {IMAGE}: {_command}")
         # start container with sudo?
         verify_dir_available = DockerOperator(
             task_id=_task_id,
             image=IMAGE,
-            container_name=f'task__ERA5Land__{version}__{_task_id}',
+            container_name=f'task__smapl3__{version}__{_task_id}',
             privileged=True,
             command=_command,
             mounts=[data_mount],
-            force_pull=True,  # make sure the image is pulled once the start of the pipeline
+            force_pull=False,
+            # make sure the image is pulled once the start of the pipeline
             auto_remove="force",
             mount_tmp_dir=False,
             docker_url='tcp://docker-proxy:2375',
@@ -140,7 +146,9 @@ for version, dag_settings in DAG_SETUP.items():
         )
 
         _task_id = "verify_qa4sm_reachable"
-        _command = f"(set -e; nc -z -v {QA4SM_IP_OR_URL} {QA4SM_PORT_OR_NONE if QA4SM_PORT_OR_NONE.lower() not in ['none', ''] else 443} 2>&1 | grep -q 'succeeded' && echo 'OK') || exit 1"
+        _command = (f"(set -e; "
+                    f"nc -z -v {QA4SM_IP_OR_URL} "
+                    f"{QA4SM_PORT_OR_NONE if QA4SM_PORT_OR_NONE.lower() not in ['none', ''] else 443} 2>&1 | grep -q 'succeeded' && echo 'OK') || exit 1")
         _doc = f"""
         Check if qa4sm is reachable, 0 = success, 1 = fail
         """
@@ -153,26 +161,29 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc
         )
 
-        # CDS Image Download----------------------------------------------------
+        # CDS Image
+        # Download----------------------------------------------------
         _task_id = f'update_images'
         _doc = f"""
         This task will check if any image data is available in the img_path.
         If not it downloads all available data after the ext_start_date (first
         time only). Otherwise, it will download new data on the server, after
         the data that is already available.
-        This will not replace any existing files locally. This finds the LATEST 
+        This will not replace any existing files locally. This finds the 
+        LATEST 
         local file and checks if any new data AFTER this date is available.
         """
-        _command = f"""bash -c '[ "$(ls -A {img_path})" ] && """ \
-                   f"""era5land update_img {img_path} --cds_token {os.environ['CDS_TOKEN']} || """ \
-                   f"""era5land download {img_path} -s {ext_start_date} -v swvl1,swvl2,swvl3,swvl4,stl1,stl2,stl3,stl4 --h_steps 0,6,12,18 --keep_prelim False --cds_token {os.environ['CDS_TOKEN']}'"""
+        # TODO Check how to access smap download
+        _command = f"""bash -c '[ "$(ls -A {img_path})" ] && smap_l3 update_img --output {img_path} --username {os.environ["SMAP_USERNAME"]} --password {os.environ["SMAP_PASSWORD"]}||  smap_l3 download --output {img_path} --time_start {ext_start_date} --username {os.environ["SMAP_USERNAME"]} --password {os.environ["SMAP_PASSWORD"]} --version 009 '"""
         logging.info(f"Running Container Command in {IMAGE}: {_command}")
 
-        # https://airflow.apache.org/docs/apache-airflow-providers-docker/stable/_api/airflow/providers/docker/operators/docker/index.html
+        # https://airflow.apache.org/docs/apache-airflow-providers-docker
+        # /stable/_api/airflow/providers/docker/operators/docker/index.html
+        # TODO check if name arbitrary
         update_images = DockerOperator(
             task_id=_task_id,
             image=IMAGE,
-            container_name=f'task__ERA5Land__{version}__{_task_id}',
+            container_name=f'task__smap__{version}__{_task_id}',
             privileged=True,
             command=_command,
             mounts=[data_mount],
@@ -184,7 +195,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Get current time series coverage -------------------------------------
+        # Get current time series coverage
+        # -------------------------------------
         _task_id = "get_img_timeranges"
         _doc = f"""
         Look at time series and image data and infer their covered period.
@@ -202,10 +214,12 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Update time series? --------------------------------------------------
+        # Update time series?
+        # --------------------------------------------------
         _task_id = "decide_ts_update"
         _doc = f"""
-        Compare image period and time series period and decide if update needed.
+        Compare image period and time series period and decide if update 
+        needed.
         This can result in
         - 'finish': No processing required
         - 'update_ts': If extensions exist, update them
@@ -217,10 +231,20 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Optional: Initial extension TS ---------------------------------------
+        # TODO test
+        # Optional: Initial extension TS
+        # ---------------------------------------
         _task_id = "extend_ts"
-        _command = f"""bash -c '[ "$(ls -A {os.path.join(ts_path, '*.nc')})" ] && era5land update_ts {ts_path} --imgpath {img_path} || """ \
-                   f"""era5land reshuffle {img_path} {ts_path} -s {ext_start_date} --land_points True --cellsize 2.5 --imgbuffer 25'"""
+        # VARS = "soil_moisture,soil_moisture_error,retrieval_qual_flag,freeze_thaw_fraction,surface_flag,surface_temperature,vegetation_opacity,vegetation_water_content,landcover_class,static_water_body_fraction,tb_time_seconds"
+        # _command = f"""bash -c '[ "$(ls -A {os.path.join(ts_path, '*.nc')})] && smap_l3 update_ts {ts_path} {img_path} || smap_l3 reshuffle --overpass BOTH --var_overpass_str True --time_key tb_time_seconds {img_path} {ts_path}  {VARS} '"""
+        # VARS = "soil_moisture,soil_moisture_error,retrieval_qual_flag,freeze_thaw_fraction,surface_flag,surface_temperature,vegetation_opacity,vegetation_water_content,landcover_class,static_water_body_fraction,tb_time_seconds"
+        #
+        # _command = f"""bash -c "[ \"$(ls -A {os.path.join(ts_path, '*.nc')})\" ] && smap_l3 update_ts {ts_path} {img_path} || smap_l3 reshuffle --overpass BOTH --var_overpass_str True --time_key tb_time_seconds {img_path} {ts_path} '{VARS}' " """
+        VARS = "soil_moisture,soil_moisture_error,retrieval_qual_flag,freeze_thaw_fraction,surface_flag,surface_temperature,vegetation_opacity,vegetation_water_content,landcover_class,static_water_body_fraction,tb_time_seconds"
+
+        _command = f"""bash -c '[ "$(ls -A {os.path.join(ts_path, '*.nc')})" ] && smap_l3 update_ts {ts_path} {img_path} || """ \
+                f"""smap_l3 reshuffle --overpass BOTH --var_overpass_str True --time_key tb_time_seconds {img_path} {ts_path} {VARS}' """
+
         _doc = f"""
         Creates new time series, or appends new data in time series format.
         """
@@ -228,7 +252,7 @@ for version, dag_settings in DAG_SETUP.items():
         extend_ts = DockerOperator(
             task_id=_task_id,
             image=IMAGE,
-            container_name=f'task__era5land__{version}__{_task_id}',
+            container_name=f'task__smap_l3__{version}__{_task_id}',
             privileged=True,
             command=_command,
             mounts=[data_mount],
@@ -240,7 +264,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Optional: Get updated time range -------------------------------------
+        # Optional: Get updated time range
+        # -------------------------------------
         _task_id = "get_ts_timerange"
         _doc = f"""
         Get the current temporal coverage of the time series data
@@ -257,7 +282,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Optional: Send new time range to QA4SM -------------------------------
+        # Optional: Send new time range to QA4SM
+        # -------------------------------
         _doc = f"""
         Report the latest covered period to the service to update it on the 
         website.
@@ -273,7 +299,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Optional: Update and push fixtures -----------------------------------
+        # Optional: Update and push fixtures
+        # -----------------------------------
         _task_id = "api_update_fixtures"
         _doc = f"""
         Dump the updated periods to fixtures and push to github.
@@ -289,7 +316,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Always check the current time range again ----------------------------
+        # Always check the current time range again
+        # ----------------------------
         _task_id = "finish"
         _doc = f""" 
         Print the current coverages again. This is just a wrap-up task that 
@@ -306,7 +334,8 @@ for version, dag_settings in DAG_SETUP.items():
             doc=_doc,
         )
 
-        # Task logic -----------------------------------------------------------
+        # Task logic
+        # -----------------------------------------------------------
         verify_dir_available >> verify_qa4sm_available >> update_images >> get_img_timeranges >> decide_reshuffle
         decide_reshuffle >> extend_ts >> get_ts_timerange >> update_period >> update_fixtures >> finish
         decide_reshuffle >> get_ts_timerange >> update_period >> update_fixtures >> finish
